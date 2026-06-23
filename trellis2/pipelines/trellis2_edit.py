@@ -28,6 +28,9 @@ from .samplers.flow_edit import (
     FlowEditSampler, VS3D_DEFAULTS,
     twin_agreement_pkeep, twin_agreement_residual,
 )
+from .samplers.editwarp import (
+    MultiViewFlowEditSampler, DEFAULT_REFINE_PROMPT, RefineFn,
+)
 from ..modules.sparse import SparseTensor
 import o_voxel
 
@@ -46,16 +49,17 @@ class Trellis2EditPipeline(Trellis2ImageTo3DPipeline):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # A dedicated FlowEdit sampler reused across the Stage-1 edit.
-        self.edit_sampler = FlowEditSampler(
-            sigma_min=getattr(self.sparse_structure_sampler, 'sigma_min', 1e-5)
-        )
+        sigma_min = getattr(self.sparse_structure_sampler, 'sigma_min', 1e-5)
+        self.edit_sampler = FlowEditSampler(sigma_min=sigma_min)
+        # Multi-view velocity guidance sampler (EditWarp).
+        self.editwarp_sampler = MultiViewFlowEditSampler(sigma_min=sigma_min)
 
     @classmethod
     def from_pretrained(cls, path: str, config_file: str = "pipeline.json") -> "Trellis2EditPipeline":
         pipeline = super().from_pretrained(path, config_file)
-        pipeline.edit_sampler = FlowEditSampler(
-            sigma_min=getattr(pipeline.sparse_structure_sampler, 'sigma_min', 1e-5)
-        )
+        sigma_min = getattr(pipeline.sparse_structure_sampler, 'sigma_min', 1e-5)
+        pipeline.edit_sampler = FlowEditSampler(sigma_min=sigma_min)
+        pipeline.editwarp_sampler = MultiViewFlowEditSampler(sigma_min=sigma_min)
         return pipeline
 
     # ------------------------------------------------------------------
@@ -376,3 +380,179 @@ class Trellis2EditPipeline(Trellis2ImageTo3DPipeline):
         if self.low_vram:
             flow_model.cpu()
         return z_tgt, z_src_twin
+
+    # ==================================================================
+    # EditWarp: multi-view velocity guidance (refinement pass)
+    # ==================================================================
+    def render_views(self, mesh_with_voxel, nviews: int = 4):
+        """Render the (edited) asset to ``nviews`` canonical views as PIL images.
+
+        Returns a list of RGB ``PIL.Image`` ordered with index 0 as the front
+        anchor view, matching the multi-view sampler's view ordering.
+        """
+        from ..utils import render_utils
+        frames = render_utils.render_snapshot([mesh_with_voxel], resolution=512, nviews=nviews)
+        colors = frames['color'] if isinstance(frames, dict) else frames
+        out = []
+        for img in colors:
+            if isinstance(img, torch.Tensor):
+                img = (img.clamp(0, 1) * 255).byte().cpu().numpy()
+            out.append(Image.fromarray(img))
+        return out
+
+    def build_refined_view_conditions(
+        self,
+        rendered_views: List[Image.Image],
+        first_edit_image: Image.Image,
+        refine_fn: Optional[RefineFn],
+        cond_res: int,
+        prompt: str = DEFAULT_REFINE_PROMPT,
+    ):
+        """Build per-view source / target conditions for multi-view guidance.
+
+        View 0 is the anchor: c_src from the source render, c_tgt from the first
+        edited image.  For views ``i>=1`` the target image is produced by the
+        refine callback ``refine_fn(rendered_view_i, first_edit_image, prompt)``;
+        if no callback is given only the anchor view is used (degrades to VS3D).
+        """
+        src_imgs = [rendered_views[0]]
+        tgt_imgs = [first_edit_image]
+        if refine_fn is not None:
+            for i in range(1, len(rendered_views)):
+                edited_i = refine_fn(rendered_views[i], first_edit_image, prompt)
+                src_imgs.append(rendered_views[i])
+                tgt_imgs.append(edited_i)
+        # encode all views to image-conditioning embeddings.
+        cond_src_views = [self.get_cond([im], cond_res, include_neg_cond=False)['cond'] for im in src_imgs]
+        cond_tgt_views = [self.get_cond([im], cond_res, include_neg_cond=False)['cond'] for im in tgt_imgs]
+        return cond_src_views, cond_tgt_views
+
+    @torch.no_grad()
+    def edit_sparse_structure_multiview(
+        self,
+        x_src: torch.Tensor,
+        cond_src_views: List[torch.Tensor],
+        cond_tgt_views: List[torch.Tensor],
+        neg_cond: torch.Tensor,
+        resolution: int,
+        edit_params: dict,
+        view_weights: Optional[List[float]] = None,
+    ) -> torch.Tensor:
+        """Multi-view occupancy editing (EditWarp) + decode to coords."""
+        flow_model = self.models['sparse_structure_flow_model']
+        if self.low_vram:
+            flow_model.to(self.device)
+        out = self.editwarp_sampler.edit_multiview(
+            flow_model, x_src,
+            cond_src_views=cond_src_views, cond_tgt_views=cond_tgt_views,
+            neg_cond=neg_cond, view_weights=view_weights, **edit_params,
+        )
+        z_edit = out.samples
+        if self.low_vram:
+            flow_model.cpu()
+
+        decoder = self.models['sparse_structure_decoder']
+        if self.low_vram:
+            decoder.to(self.device)
+        decoded = decoder(z_edit) > 0
+        if self.low_vram:
+            decoder.cpu()
+        if resolution != decoded.shape[2]:
+            ratio = decoded.shape[2] // resolution
+            decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5
+        coords = torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()
+        return coords
+
+    # PLACEHOLDER_RUN_EDITWARP
+
+    @torch.no_grad()
+    def run_editwarp(
+        self,
+        mesh: trimesh.Trimesh,
+        edited_image: Image.Image,
+        source_image: Optional[Image.Image] = None,
+        refine_fn: Optional[RefineFn] = None,
+        refine_prompt: str = DEFAULT_REFINE_PROMPT,
+        nviews: int = 4,
+        view_weights: Optional[List[float]] = None,
+        seed: int = 42,
+        pipeline_type: str = '1024',
+        preprocess_image: bool = True,
+        edit_params: Optional[dict] = None,
+        tar_params: Optional[dict] = None,
+    ):
+        """Two-pass EditWarp editing: VS3D anchor edit -> multi-view refinement.
+
+        Pass 1 runs the single-view VS3D pipeline (:meth:`run`) to obtain an
+        anchor edit.  The anchor result is rendered to ``nviews`` views; the
+        refine callback produces a geometry-consistent edited image for each
+        extra view (EditWarp Sec. 1.5.2).  Pass 2 re-edits the occupancy with
+        multi-view velocity guidance, then regenerates Stage-2/3 SLATs with TAR.
+
+        Args:
+            refine_fn: ``(rendered_view, first_edit_image, prompt) -> edited_view``.
+                If ``None``, EditWarp degrades to single-view VS3D.
+            nviews: number of views (index 0 is the front anchor).
+            view_weights: per-view fusion weights ``w_i`` (len ``nviews``).
+        """
+        edit_params = {**VS3D_DEFAULTS, **(edit_params or {})}
+        tar_params = {
+            'lam': 0.5, 'tau': 10.0, 'theta': 0.7, 'alpha': 0.05, 'beta': 0.95,
+            **(tar_params or {}),
+        }
+        resolution = 512 if pipeline_type == '512' else 1024
+        cond_res = 512 if pipeline_type == '512' else 1024
+
+        # ---- Pass 1: single-view VS3D anchor edit -----------------------
+        anchor_mesh = self.run(
+            mesh=mesh, edited_image=edited_image, source_image=source_image,
+            seed=seed, pipeline_type=pipeline_type,
+            preprocess_image=preprocess_image,
+            edit_params=edit_params, tar_params=tar_params,
+        )[0]
+
+        if refine_fn is None:
+            # No refinement available: anchor edit is the result.
+            return [anchor_mesh]
+
+        # ---- Build multi-view conditions from the anchor render ---------
+        if source_image is None:
+            source_image = self.render_source_condition(mesh)
+        first_edit = self.preprocess_image(edited_image) if preprocess_image else edited_image
+        rendered_views = self.render_views(anchor_mesh, nviews=nviews)
+        # anchor view 0 source = source render; replace rendered_views[0] with it.
+        rendered_views[0] = self.preprocess_image(source_image) if preprocess_image else source_image
+        cond_src_views, cond_tgt_views = self.build_refined_view_conditions(
+            rendered_views, first_edit, refine_fn, cond_res, refine_prompt)
+        neg_cond = torch.zeros_like(cond_src_views[0])
+
+        # ---- Pass 2: multi-view occupancy editing -----------------------
+        x_src = self.encode_source_occupancy(mesh, ss_res=64)
+        ss_res = {'512': 32, '1024': 64}[pipeline_type]
+        coords = self.edit_sparse_structure_multiview(
+            x_src, cond_src_views, cond_tgt_views, neg_cond, ss_res,
+            edit_params, view_weights)
+
+        # ---- Stage 2/3 with TAR (anchor target condition) ---------------
+        cond_tgt = {'cond': cond_tgt_views[0], 'neg_cond': neg_cond}
+        cond_src = {'cond': cond_src_views[0], 'neg_cond': neg_cond}
+        shape_model = self.models[f'shape_slat_flow_model_{resolution}']
+        z_geo_tgt, z_geo_twin = self.sample_shape_slat_twin(
+            cond_tgt, cond_src, shape_model, coords, {}, seed)
+        z_geo_src = self.encode_source_shape_slat(mesh, resolution)
+        z_geo = self.apply_tar(z_geo_tgt, z_geo_twin, z_geo_src, tar_params)
+        std = torch.tensor(self.shape_slat_normalization['std'])[None].to(z_geo.device)
+        mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(z_geo.device)
+        shape_slat = z_geo * std + mean
+
+        tex_model = self.models[f'tex_slat_flow_model_{resolution}']
+        z_tex_tgt, z_tex_twin = self.sample_tex_slat_twin(
+            cond_tgt, cond_src, tex_model, shape_slat, seed)
+        z_tex_src = self.encode_source_tex_slat(mesh, resolution)
+        z_tex = self.apply_tar(z_tex_tgt, z_tex_twin, z_tex_src, tar_params)
+        std = torch.tensor(self.tex_slat_normalization['std'])[None].to(z_tex.device)
+        mean = torch.tensor(self.tex_slat_normalization['mean'])[None].to(z_tex.device)
+        tex_slat = z_tex * std + mean
+
+        torch.cuda.empty_cache()
+        return self.decode_latent(shape_slat, tex_slat, resolution)
